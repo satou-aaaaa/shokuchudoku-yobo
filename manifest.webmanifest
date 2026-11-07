@@ -1,0 +1,29 @@
+{
+  "name": "食中毒よぼう",
+  "short_name": "食中毒よぼう",
+  "description": "家庭でできる食中毒予防の3原則・6つのポイント・温度のめやす・原因の特徴を当てる1日5問（厚生労働省・農林水産省の資料にもとづく。医療の助言ではありません）",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f1e7",
+  "theme_color": "#f6f1e7",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
