@@ -393,6 +393,8 @@ try {
       check("正解すると、選び肢の原因の札が出る（組み合わせの問題は4枚。読み・起きやすい食べ物・特徴。幅320pxではみ出さない）", cd.n === 4 && cd.txt.some((t) => t.includes(ans.split("：")[0] + "（")) && cd.txt.some((t) => /起きやすい：/.test(t)) && cd.w <= 320 && cd.sw <= 320, JSON.stringify(cd).slice(0, 300));
       await q.context().close();
     }
+    // 星：取れなかった星は ☆（色だけで分けない）・読み上げは「星Nつ」だけ（2026-11-07 CodeRabbit）
+    check("星の表示：取れなかった星は☆で、role=img と「星Nつ」の名前を持つ", await (async () => { const q = await newPage(390); const r = await q.evaluate(() => { const d = document.createElement("div"); d.innerHTML = starStr(1); const s = d.firstElementChild; return s.getAttribute("role") === "img" && s.getAttribute("aria-label") === "星1つ" && s.textContent === "★☆☆"; }); await q.context().close(); return r; })());
     check("幅320px・とても大きい文字でも横にはみ出さない", bad.length === 0, bad.join(" / "));
     check("押せる所は高さ44px以上", small.length === 0, [...new Set(small)].slice(0, 8).join(","));
   }
