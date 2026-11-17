@@ -4,7 +4,7 @@
 # Claude Code のクラウドセッションでは .claude/settings.json の SessionStart フックが自動で呼ぶ。
 # CI の Setup check（共通部品）が、まっさらな環境でこれが通るかを確かめる。
 # ひな形: satou-aaaaa/shared-workflows の template/scripts/setup.sh。ゲームはそのまま写せば動く（npm_dir と next だけ、ちがえば書き換える）。
-# ひな形の版: 10（上げたら写しの版も上げる。scripts/drift-check.mjs が古い写しを週次まとめに出す）
+# ひな形の版: 13（上げたら写しの版も上げる。scripts/drift-check.mjs が古い写しを週次まとめに出す）
 #   2: 依存は毎回 npm ci・ブラウザが無ければ止める・このシェルで要る操作（nvm use・export）を最後に出す（shared-workflows incidents/2026-11-03-setup-false-ready.md）
 #   3: nvm.sh を --no-use で読む（.nvmrc の版が入っていないと、読んだだけで何も言わずに止まっていた。incidents/2026-11-04-setup-nvm-silent-stop.md）
 #   4: ブラウザの場所はファイルかも見る（-x だけだとフォルダでも通った。2026-11-05 CodeRabbit が bunshi-tsukuri #1 で指摘）
@@ -19,6 +19,10 @@
 #  10: .nvmrc の先頭の数字（メジャー版）だけを読む（22.11.0 が 22110 になっていた）・nvm install の失敗で止めて知らせる・
 #      依存を使い回すのは QA と同じ import() で Playwright を読めるときだけ（ESM の入口が欠けても通っていた）・
 #      2つ同時に動いても npm ci を重ねない（ロック）・Git Bash では CHROMIUM_PATH を Windows の形に直す（2026-11-07 shared-workflows #219）
+#  11: 強制終了で残ったロックは、同じ機械で持ち主が動いていなければ外す（10分待って止まっていた。#259）
+#  12: 起動の試しは package.json に書いた Playwright を先に使う・ブラウザの置き場も QA と同じ import() で探す・
+#      古いロックは自分だけの名前へ移してから消す（2つ同時に外して新しいロックを消さない）・名札の無い1分より古いロックも外す・ほかの人の動いているプロセスのロックは外さない（各ゲームの PR の CodeRabbit、2026-11-07）
+#  13: 古いロックは移さず、外す人の札（.setup-lock.reclaim.<inode>。時間でなく持ち主が動いているかで見る）を取った1人が見直してから消す（移したあいだに別の setup.sh がロックを取り、npm ci が2つ走ることがあった。2026-11-17 hatsuden-kurabe #1・nenkin-shikumi #1 の CodeRabbit）
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -72,16 +76,61 @@ deps_ok() { [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sum" ] && (cd "$npm_dir" 
 # 2つのセッションが同時に動いても npm ci を重ねない（片方が入れている node_modules をもう片方が消す。版10）
 lock="$npm_dir/.setup-lock"
 got=""
-for _ in $(seq 1 600); do if mkdir "$lock" 2>/dev/null; then got=1; break; fi; sleep 1; done
-[ -n "$got" ] || fail "$lock が10分消えない（ほかの setup.sh が止まったまま。動いていなければ rmdir $lock）"   # 取れなかったら進まない・人のロックを消さない
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+me="$(hostname 2>/dev/null || echo local) $$"
+# 持ち主（同じ機械で、もう動いていない）が強制終了で残したロックだけを外す。別の機械のロックは外さない（版11の CodeRabbit）。
+# 名札の無いロック（作った直後に止まった）は、1分より古ければ外す（版12）
+# 動いているか。ほかの人のプロセスは kill -0 が「権限が無い」で失敗するので、それも動いているとみなす（版12、setsuden-kotsu #7 の CodeRabbit）
+alive() { kill -0 "$1" 2>/dev/null && return 0; kill -0 "$1" 2>&1 | grep -qi 'not permitted'; }
+stale() {
+  local o
+  if ! o=$(cat "$lock/owner" 2>/dev/null); then [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] && echo "（名札なし）"; return; fi
+  [ "${o% *}" = "${me% *}" ] && ! alive "${o##* }" && echo "$o"
+}
+# 外すのは、外す人の札を取った1人だけ。札を持ったまま、もう一度見て同じ古いロックのときだけ消す。
+# 動いているロックは移さない・消さない（前は自分の名前へ移してから見たので、移したあいだに別の setup.sh が空いた場所でロックを取り、
+# 2つの npm ci が同じ node_modules を変えることがあった。版13、hatsuden-kurabe #1・nenkin-shikumi #1 の CodeRabbit）。
+# 札はロックのフォルダごと（番号＝inode。同じ名前で作り直したロックとは別の札）。札を取った人は、外し終えたら自分の札だけを消す。
+# 札は時間では外さない（止まっているだけの人が戻って、あとの人のロックを消す）。札の持ち主が同じ機械でもう動いていないときだけ、
+# 札の名前に持ち主の番号を足した次の札を取る。名札を書く前に止まった札（名札なし）は、1分より古ければ動いていないとみなす。
+# 札を取れなかったときは 1 を返す（待ってから見直す。すぐ回すと10分の待ちを一瞬で使い切る）
+ino() { ls -di "$lock" 2>/dev/null | awk '{print $1}'; }
+reclaim() {
+  local seen=$1 id guard o dead=()
+  id=$(ino); [ -n "$id" ] || return 0
+  guard="$lock.reclaim.$id"
+  for _ in 1 2 3 4 5 6 7 8; do
+    if mkdir "$guard" 2>/dev/null; then
+      echo "$me" > "$guard/owner"
+      if [ "$(ino)" = "$id" ] && [ "$(stale)" = "$seen" ]; then echo "前の setup.sh が残したロックを外す（$seen）"; rm -rf "$lock"; fi
+      # 自分の札と、通ってきた止まった人の札を片づける（札を取った人は、消したあとのロックをもう一度見るので、片づけてもあとの人は消さない）
+      rm -rf "$guard" ${dead[@]+"${dead[@]}"}   # 空の配列でも bash 3.2（macOS）の set -u で止まらない書き方
+      return 0
+    fi
+    if ! o=$(cat "$guard/owner" 2>/dev/null); then
+      [ -n "$(find "$guard" -maxdepth 0 -mmin +1 2>/dev/null)" ] || return 1
+      o="x x"
+    elif [ "${o% *}" != "${me% *}" ] || alive "${o##* }"; then
+      return 1
+    fi
+    dead+=("$guard")
+    guard="$guard.${o##* }"
+  done
+  return 1
+}
+for _ in $(seq 1 600); do
+  if mkdir "$lock" 2>/dev/null; then echo "$me" > "$lock/owner"; got=1; break; fi
+  if o=$(stale) && [ -n "$o" ] && reclaim "$o"; then continue; fi
+  sleep 1
+done
+[ -n "$got" ] || fail "$lock が10分消えない（ほかの setup.sh が止まったまま。動いていなければ rm -r $lock）"   # 取れなかったら進まない・人のロックを消さない
+trap 'rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true' EXIT
 if deps_ok; then
   echo "依存は lock どおりに入っている（入れ直さない）"
 else
   (cd "$npm_dir" && npm ci --include=dev --no-audit --no-fund)   # NODE_ENV=production でも検査の道具（devDependencies）を入れる（版6）
   echo "$sum" > "$stamp"
 fi
-rmdir "$lock" 2>/dev/null || true
+rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true
 trap - EXIT   # 返したあとは、あとから来た setup.sh のロックを終わりに消さない
 
 # Playwright のブラウザ。検査は CHROMIUM_PATH があればそれを、無ければ Playwright の置き場のものを使う
@@ -99,7 +148,8 @@ if [ "${PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD:-}" = 1 ]; then
   elif runnable "$pre"; then
     session_env "CHROMIUM_PATH=$(q "$pre")"; export CHROMIUM_PATH="$pre"
   else
-    def=$(cd "$npm_dir" && node -e 'try{process.stdout.write(require("playwright").chromium.executablePath())}catch{}' 2>/dev/null || true)
+    # QA と同じ import() で探す（require では ESM の入口だけがあるとき見つからない。版12、kokoku-minuki #2 の CodeRabbit）
+    def=$(cd "$npm_dir" && node --input-type=module -e 'for (const m of ["playwright", "playwright-core", "@playwright/test"]) { try { const pw = await import(m); const c = pw.chromium || (pw.default && pw.default.chromium); process.stdout.write(c.executablePath()); break; } catch {} }' 2>/dev/null || true)
     [ -n "$def" ] && runnable "$def" || fail "使えるブラウザが無い（PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 で取ってこない設定）。CHROMIUM_PATH にブラウザの場所を入れるか、PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD を外して入れ直す"
   fi
 else
@@ -116,7 +166,8 @@ if ! err=$(cd "$npm_dir" && node --input-type=module -e '
   import { readFileSync } from "node:fs";
   const names = ["playwright", "playwright-core", "@playwright/test"];
   const pkg = JSON.parse(readFileSync("package.json", "utf8")), want = names.filter((m) => (pkg.dependencies || {})[m] || (pkg.devDependencies || {})[m]);
-  let pw; for (const m of names) { try { pw = await import(m); break; } catch {} }   // QA と同じ import()（版10）
+  // package.json に書いたものを先に試す（書いていない別の版が間接に入っていても、そちらで「✓」を出さない。版12、akushitsu-miyaburi #4 の CodeRabbit）
+  let pw; for (const m of [...want, ...names.filter((n) => !want.includes(n))]) { try { pw = await import(m); break; } catch {} }   // QA と同じ import()（版10）
   if (!pw && want.length) { console.error("package.json に " + want.join("・") + " があるのに読み込めない（npm ci が入れ損ねた。node_modules を消して入れ直す）"); process.exit(1); }
   if (!pw) process.exit(0);
   const chromium = pw.chromium || (pw.default && pw.default.chromium);
